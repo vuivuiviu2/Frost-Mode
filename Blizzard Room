@@ -1,0 +1,385 @@
+if _G.CeilingTrapConnection then
+	_G.CeilingTrapConnection:Disconnect()
+	_G.CeilingTrapConnection = nil
+end
+
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+
+local player = Players.LocalPlayer
+
+
+local CEILING_MODEL_ID = "rbxassetid://98844994601455"
+local HEIGHT_OFFSET = 3.5
+local SLOWED_SPEED = 8
+
+
+local TORNADO_MODEL_ID = "rbxassetid://105600655846697"
+local MOVE_SPEED = 10
+local ROTATE_SPEED = 720
+local DAMAGE = 7
+local DAMAGE_COOLDOWN = 0.5
+local CHANGE_DIRECTION_TIME = 2
+local SHAKE_RADIUS = 60
+local MAX_SHAKE_STRENGTH = 0.6
+local KNOCKBACK_FORCE = 7
+local ICE_BLUE_COLOR = Color3.fromRGB(135, 206, 250)
+
+
+local slowActive = false
+local spawnedCeilingModels = {}
+local tornadoEntity = nil
+local spawnZone = nil
+local targetRoomId = nil 
+local hasSpawned = false
+local killed = false
+local currentRotation = 0
+local lastDirectionChange = tick()
+local lastDamageTime = 0 
+local direction = Vector3.new(math.random(-100,100), 0, math.random(-100,100)).Unit
+
+
+local function getChar()
+	return player.Character or player.CharacterAdded:Wait()
+end
+
+
+local function getHumanoid()
+	return getChar():WaitForChild("Humanoid")
+end
+
+
+local function getRoot()
+	return getChar():WaitForChild("HumanoidRootPart")
+end
+
+
+local function OnEntityKill()
+	local hum = getHumanoid()
+	if hum then hum.Health = 0 end
+	if ReplicatedStorage:FindFirstChild("GameStats") then
+		local pStats = ReplicatedStorage.GameStats:FindFirstChild('Player_' .. player.Name)
+		if pStats and pStats:FindFirstChild("Total") and pStats.Total:FindFirstChild("DeathCause") then
+			pStats.Total.DeathCause.Value = 'Tornado'
+		end
+	end
+end
+
+
+local function getCurrentRoom()
+	local gameData = ReplicatedStorage:WaitForChild("GameData", 3)
+	if not gameData then return nil end
+	local latestRoomObj = gameData:FindFirstChild("LatestRoom")
+	if not latestRoomObj then return nil end
+	
+	local current = latestRoomObj.Value
+	local rooms = workspace:WaitForChild("CurrentRooms")
+	for _, room in ipairs(rooms:GetChildren()) do
+		if tonumber(room.Name) == current then
+			return room, current
+		end
+	end
+end
+
+
+local function getFloor(room)
+	for _, v in ipairs(room:GetDescendants()) do
+		if v:IsA("BasePart") and v.Name == "Floor" then
+			return v
+		end
+	end
+end
+
+
+local function getRandomPosOnFloor(floor)
+	local floorSize = floor.Size
+	local limitX = (floorSize.X / 2) - 4
+	local limitZ = (floorSize.Z / 2) - 4
+	
+	local randomX = (limitX <= 1) and 0 or math.random(-math.floor(limitX), math.floor(limitX))
+	local randomZ = (limitZ <= 1) and 0 or math.random(-math.floor(limitZ), math.floor(limitZ))
+	
+	return Vector3.new(randomX, 0, randomZ)
+end
+
+
+local function addCeilingSound(model)
+	local root = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart")
+	if not root then return end
+	local sound = Instance.new("Sound")
+	sound.Name = "EntitySound"
+	sound.SoundId = "rbxassetid://4175285709"
+	sound.RollOffMaxDistance = 100
+	sound.RollOffMinDistance = 10
+	sound.Volume = 2
+	sound.Looped = true
+	sound.PlaybackSpeed = 1.4
+	sound.Parent = root
+	sound:Play()
+end
+
+
+local function spawnCeilingModel(room, floor, attachSound)
+	local objects = game:GetObjects(CEILING_MODEL_ID)
+	local model = nil
+	for _, v in ipairs(objects) do
+		if v:IsA("Model") then model = v; break end
+	end
+	if not model then return end
+
+
+	model.Parent = workspace
+	table.insert(spawnedCeilingModels, model)
+	
+	if attachSound then addCeilingSound(model) end
+
+
+	for _, v in ipairs(model:GetDescendants()) do
+		if v:IsA("BasePart") then
+			v.Anchored = true
+			v.CanCollide = false
+			v.CanTouch = false
+			v.CanQuery = false
+		end
+		if v:IsA("ParticleEmitter") then
+			v.Rate = 200
+			v.Enabled = true
+		end
+	end
+
+
+	local floorCF = floor.CFrame
+	local _, size = model:GetBoundingBox()
+	local randomOffset = getRandomPosOnFloor(floor)
+	
+	local targetPos = floorCF.Position + randomOffset + Vector3.new(0, size.Y/2 + HEIGHT_OFFSET, 0)
+	model:PivotTo(CFrame.new(targetPos))
+end
+
+
+local function checkTornadoDamage(body)
+	local char = player.Character
+	if not char then return end
+	local humanoid = char:FindFirstChildOfClass("Humanoid")
+	local hrp = char:FindFirstChild("HumanoidRootPart")
+	if not humanoid or humanoid.Health <= 0 or not hrp then return end
+
+
+	local distance = (hrp.Position - body.Position).Magnitude
+	local hitRadius = (body.Size.X / 2) + 2.5 
+
+
+	if distance <= hitRadius then
+		if tick() - lastDamageTime >= DAMAGE_COOLDOWN then
+			lastDamageTime = tick()
+			
+			humanoid.Health = math.max(0, humanoid.Health - DAMAGE)
+
+
+			if humanoid.Health <= 0 and not killed then
+				killed = true
+				OnEntityKill()
+			end
+
+
+			local dir = (hrp.Position - body.Position).Unit
+			hrp.CFrame += Vector3.new(dir.X, 0, dir.Z) * KNOCKBACK_FORCE
+		end
+	end
+end
+
+
+local function spawnTornado(room, floor)
+	local objects = game:GetObjects(TORNADO_MODEL_ID)
+	local model = nil
+	for _, v in ipairs(objects) do
+		if v:IsA("Model") then model = v; break end
+	end
+	if not model then return end
+
+
+	tornadoEntity = model:Clone()
+	tornadoEntity.Parent = workspace
+
+
+	local body = tornadoEntity:FindFirstChild("hitbox", true) 
+		or tornadoEntity:FindFirstChild("Hitbox", true) 
+		or tornadoEntity:FindFirstChild("Body", true) 
+		or tornadoEntity.PrimaryPart
+
+
+	if not body then tornadoEntity:Destroy(); return end
+	tornadoEntity.PrimaryPart = body
+
+
+	body.Anchored = true
+	body.CanCollide = false
+	body.CanTouch = true
+	body.CanQuery = true 
+	body.Massless = true
+	body.Transparency = 1
+	if body:FindFirstChild("Wind") and body.Wind:FindFirstChild("Sound") then
+		body.Wind.Sound.RollOffMaxDistance = 100
+		body.Wind.Sound.RollOffMinDistance = 10
+	end
+	if body:FindFirstChild("Wind") then body.Wind.Transparency = 0.85 end
+
+
+	for _, v in ipairs(tornadoEntity:GetDescendants()) do
+		if v:IsA("BasePart") then
+			v.Anchored = true
+			v.CanCollide = false
+			v.CanTouch = true
+			v.CanQuery = true
+			v.Color = ICE_BLUE_COLOR 
+		end
+		if v:IsA("ParticleEmitter") then
+			v.Color = ColorSequence.new(ICE_BLUE_COLOR) 
+			v.Enabled = true
+		end
+		if v:IsA("Decal") or v:IsA("Texture") then
+			v.Color3 = ICE_BLUE_COLOR 
+		end
+	end
+
+
+	local light = Instance.new("PointLight")
+	light.Name = "IceTornadoLight"
+	light.Color = ICE_BLUE_COLOR
+	light.Range = 10
+	light.Brightness = 3
+	light.Parent = body
+
+
+	local floorCF = floor.CFrame
+	local randomOffset = getRandomPosOnFloor(floor)
+	local finalSpawnPos = floorCF.Position + randomOffset + Vector3.new(0, body.Size.Y/2 + 1, 0)
+
+
+	tornadoEntity:PivotTo(CFrame.new(finalSpawnPos))
+end
+
+
+local function clearAllEntities()
+	for _, m in ipairs(spawnedCeilingModels) do
+		if m and m.Parent then m:Destroy() end
+	end
+	table.clear(spawnedCeilingModels)
+
+
+	if tornadoEntity then tornadoEntity:Destroy(); tornadoEntity = nil end
+	if spawnZone then spawnZone:Destroy(); spawnZone = nil end
+end
+
+
+local mainConnection
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+
+mainConnection = RunService.RenderStepped:Connect(function(dt)
+	local hum = getHumanoid()
+	local room, id = getCurrentRoom()
+	
+	if hum and slowActive then
+		if hum.WalkSpeed ~= SLOWED_SPEED then
+			hum.WalkSpeed = SLOWED_SPEED
+		end
+	end
+
+
+	if not room then return end
+	local floor = getFloor(room)
+	if not floor then return end
+
+
+	if not targetRoomId then
+		targetRoomId = id
+	end
+
+
+	if id == targetRoomId and not hasSpawned then
+		hasSpawned = true
+
+
+		for i = 1, 7 do
+			spawnCeilingModel(room, floor, i == 1)
+		end
+
+
+		spawnTornado(room, floor)
+		
+		slowActive = true
+	end
+
+
+	if tornadoEntity and tornadoEntity.PrimaryPart then
+		local body = tornadoEntity.PrimaryPart
+		local pos = body.Position
+		local hrp = getRoot()
+		local camera = workspace.CurrentCamera
+
+
+		checkTornadoDamage(body)
+
+
+		if hrp then
+			local dist = (hrp.Position - pos).Magnitude
+			if dist <= SHAKE_RADIUS then
+				local intensity = 1 - (dist / SHAKE_RADIUS)
+				local shake = intensity * MAX_SHAKE_STRENGTH
+				local offset = Vector3.new((math.random() - 0.3) * shake, (math.random() - 0.3) * shake, (math.random() - 0.3) * shake)
+				camera.CFrame = camera.CFrame * CFrame.new(offset)
+			end
+		end
+
+
+		if tick() - lastDirectionChange >= CHANGE_DIRECTION_TIME then
+			lastDirectionChange = tick()
+			direction = Vector3.new(math.random(-100,100), 0, math.random(-100,100)).Unit
+		end
+
+
+		rayParams.FilterDescendantsInstances = {tornadoEntity}
+		local ray = workspace:Raycast(pos, direction * 8, rayParams)
+		if ray then
+			direction = Vector3.new(math.random(-100,100), 0, math.random(-100,100)).Unit
+		end
+
+
+		local newPos = pos + (direction * MOVE_SPEED * dt)
+		local floorCF = floor.CFrame
+		local floorSize = floor.Size
+		local limitX = (floorSize.X / 2) - 3
+		local limitZ = (floorSize.Z / 2) - 3
+
+
+		newPos = Vector3.new(
+			math.clamp(newPos.X, floorCF.Position.X - limitX, floorCF.Position.X + limitX),
+			pos.Y,
+			math.clamp(newPos.Z, floorCF.Position.Z - limitZ, floorCF.Position.Z + limitZ)
+		)
+
+
+		currentRotation = (currentRotation or 0) + (ROTATE_SPEED * dt)
+		tornadoEntity:PivotTo(CFrame.new(newPos) * CFrame.Angles(0, math.rad(currentRotation), 0))
+	end
+
+
+	if id ~= targetRoomId and hasSpawned then
+		clearAllEntities()
+		slowActive = false
+		if hum then hum.WalkSpeed = 16 end 
+		
+		if mainConnection then
+			mainConnection:Disconnect()
+			_G.CeilingTrapConnection = nil
+		end
+	end
+end)
+
+
+_G.CeilingTrapConnection = mainConnection
